@@ -2,7 +2,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-BOT_TOKEN = "8568040647:AAHrjk2CnFeKJ0gYFZQp4mDCKd02nyyOii0"
+BOT_TOKEN = "8568040647:AAGo6PjE_gHyooSLhuR_wfLHW5zziSPZVY8"
 
 LOG_FILE = "logs.txt"   # Put your logs here
 
