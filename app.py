@@ -35,12 +35,12 @@ from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # -------- CONFIG ----------
-BOT_TOKEN = "8568040647:AAHrjk2CnFeKJ0gYFZQp4mDCKd02nyyOii0"  # your token
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LOG_FILE = "logs.txt"
 KEYS_FILE = "keys.txt"
 USERS_FILE = "users.json"
 ADMINS_FILE = "admins.json"
-SEEN_FILE = "seen.json"
+USER_SEEN_FILE = "user_seen.json"
 UPLOAD_TMP = "/tmp"
 MAX_ALLOWED_LINES = 300
 
@@ -55,8 +55,8 @@ logger = logging.getLogger(__name__)
 EMAIL_REGEX = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 users_set: Set[int] = set()
 admins_set: Set[int] = set()
-seen_lines: Set[str] = set()   # global dedupe (persisted)
-redeemed: Dict[int, str] = {}  # user_id -> expiry ISOdate string (persisted? We keep in memory and store to users.json)
+user_seen: Dict[int, Set[str]] = {}  # per-user seen lines
+redeemed: Dict[int, str] = {}  # user_id -> expiry ISOdate string
 
 # ---------- Helpers: persistence ----------
 def safe_load_json(path: str, default):
@@ -76,18 +76,36 @@ def save_json(path: str, content):
         logger.exception("Failed saving %s: %s", path, e)
 
 def load_state():
-    global users_set, admins_set, seen_lines
-    users = safe_load_json(USERS_FILE, [])
+    global users_set, admins_set, user_seen, redeemed
+    users_data = safe_load_json(USERS_FILE, [])
+    if isinstance(users_data, dict):
+        users = users_data.get("users", [])
+        redeemed = {int(k): v for k, v in users_data.get("redeemed", {}).items()}
+    else:
+        users = users_data
     users_set = set(int(x) for x in users)
     admins = safe_load_json(ADMINS_FILE, [])
     if not admins:
         admins = SEED_ADMINS
     admins_set = set(int(x) for x in admins)
-    # ensure seeds
     admins_set.update(SEED_ADMINS)
     save_json(ADMINS_FILE, sorted(list(admins_set)))
-    seen = safe_load_json(SEEN_FILE, [])
-    seen_lines = set(seen)
+    seen_data = safe_load_json(USER_SEEN_FILE, {})
+    for uid, lines in seen_data.items():
+        user_seen[int(uid)] = set(lines)
+
+def get_user_seen(uid: int) -> Set[str]:
+    if uid not in user_seen:
+        user_seen[uid] = set()
+    return user_seen[uid]
+
+def save_user_seen(uid: int):
+    try:
+        seen_data = safe_load_json(USER_SEEN_FILE, {})
+        seen_data[str(uid)] = list(user_seen.get(uid, set()))
+        save_json(USER_SEEN_FILE, seen_data)
+    except Exception as e:
+        logger.exception("Failed to save user seen: %s", e)
 
 def persist_users_and_redeemed():
     # Persist known users plus redeemed info for convenience
@@ -100,11 +118,6 @@ def persist_users_and_redeemed():
     except Exception as e:
         logger.exception("persist users failed: %s", e)
 
-def persist_seen():
-    try:
-        save_json(SEEN_FILE, sorted(list(seen_lines)))
-    except Exception as e:
-        logger.exception("persist seen failed: %s", e)
 
 # ---------- Keys handling ----------
 def parse_keys_file() -> List[Dict[str, Any]]:
@@ -254,41 +267,46 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     results: List[str] = []
-    added = 0
+    user_seen_set = get_user_seen(user.id)
+    new_seen: List[str] = []
     try:
         with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
             for raw in f:
-                line = raw.rstrip("\n")
-                # skip globally seen lines
-                if line in seen_lines:
+                line = raw.strip()
+                if not line:
                     continue
-                # per-search dedupe
-                if line in results:
+                line_lower = line.lower()
+                if line_lower in user_seen_set:
                     continue
-                if keyword.lower() in line.lower():
+                if keyword.lower() in line_lower:
                     results.append(line)
-                    seen_lines.add(line)  # mark globally so nobody else receives again
-                    added += 1
-                    if added >= max_lines:
+                    new_seen.append(line_lower)
+                    if len(results) >= max_lines:
                         break
-        # persist seen lines (so duplicates don't reappear after restart)
-        persist_seen()
         if not results:
-            await update.message.reply_text("No results found (subject to dedupe/filters).")
+            await update.message.reply_text("No new results found. You may have seen all matching lines.")
             return
-        # send a small preview then file
-        preview = "\n".join(results[:10])
-        await update.message.reply_text(f"Found {len(results)} results. Preview:\n\n{preview}")
-        # write and send file
-        fname = f"results_{user.id}_{int(datetime.utcnow().timestamp())}.txt"
-        path = os.path.join(UPLOAD_TMP, fname)
+        for ln in new_seen:
+            user_seen_set.add(ln)
+        save_user_seen(user.id)
+        filename = f"results_{keyword}.txt"
+        path = os.path.join(UPLOAD_TMP, f"results_{user.id}_{int(datetime.utcnow().timestamp())}.txt")
         with open(path, "w", encoding="utf-8") as out:
             out.write("\n".join(results))
-        await context.bot.send_document(chat_id=user.id, document=InputFile(path, filename=f"results_{keyword}.txt"))
+        with open(path, "rb") as doc:
+            await update.message.reply_document(document=doc, filename=filename)
         try:
             os.remove(path)
         except Exception:
             pass
+        for admin_id in admins_set:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"🔍 Search Alert:\nUser: {user.id} (@{user.username or 'N/A'})\nKeyword: {keyword}\nResults: {len(results)} lines"
+                )
+            except Exception:
+                pass
     except Exception as e:
         logger.exception("Search error: %s", e)
         await update.message.reply_text("Search failed: " + str(e))
@@ -354,15 +372,14 @@ async def announce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- startup ----------
 def ensure_files_exist():
-    # create placeholder files if missing
     if not os.path.exists(KEYS_FILE):
         open(KEYS_FILE, "a", encoding="utf-8").close()
     if not os.path.exists(USERS_FILE):
         save_json(USERS_FILE, [])
     if not os.path.exists(ADMINS_FILE):
         save_json(ADMINS_FILE, SEED_ADMINS)
-    if not os.path.exists(SEEN_FILE):
-        save_json(SEEN_FILE, [])
+    if not os.path.exists(USER_SEEN_FILE):
+        save_json(USER_SEEN_FILE, {})
 
 def main():
     ensure_files_exist()
@@ -381,288 +398,6 @@ def main():
     app.add_handler(CommandHandler("gen", gen_cmd))
     app.add_handler(CommandHandler("downloadkey", downloadkey_cmd))
     app.add_handler(CommandHandler("announce", announce_cmd))
-
-    logger.info("Bot starting (polling)...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()        sessions[user_id] = {
-            "unlocked": False,
-            "used_key": None,
-        }
-    return sessions[user_id]
-
-def parse_keys_file() -> List[Dict[str, Optional[datetime]]]:
-    """Return list of {key: str, expires: datetime|None, raw: str}"""
-    entries = []
-    if not os.path.exists(KEYS_FILE):
-        return entries
-    try:
-        with open(KEYS_FILE, "r", encoding="utf-8") as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                m = KEY_LINE_RE.match(ln)
-                if not m:
-                    # try splitting by | and trimming
-                    parts = [p.strip() for p in ln.split("|")]
-                    key = parts[0] if parts else ln
-                    expires = None
-                    if len(parts) >= 2:
-                        try:
-                            expires = datetime.strptime(parts[1], "%Y-%m-%d")
-                        except Exception:
-                            expires = None
-                    entries.append({"key": key, "expires": expires, "raw": ln})
-                else:
-                    key = m.group(1).strip()
-                    exp_s = m.group(2)
-                    expires = None
-                    if exp_s:
-                        try:
-                            expires = datetime.strptime(exp_s, "%Y-%m-%d")
-                        except Exception:
-                            expires = None
-                    entries.append({"key": key, "expires": expires, "raw": ln})
-    except Exception as e:
-        logger.exception("Failed to read keys.txt: %s", e)
-    return entries
-
-def is_key_valid(key: str) -> (bool, Optional[str]):
-    """Return (True, None) if key exists and not expired; otherwise (False, reason)."""
-    key = key.strip()
-    items = parse_keys_file()
-    for it in items:
-        if it["key"] == key:
-            if it["expires"] and it["expires"].date() < datetime.utcnow().date():
-                return False, f"expired on {it['expires'].date().isoformat()}"
-            return True, None
-    return False, "not found"
-
-def generate_key(days: int) -> Dict[str, Any]:
-    """Generate a key, append to keys.txt, return dict with key and expiry."""
-    days = max(1, int(days))
-    key = secrets.token_urlsafe(12).replace("=", "")  # compact key
-    expiry = (datetime.utcnow().date() + timedelta(days=days))
-    line = f"{key}|{expiry.isoformat()}\n"
-    try:
-        with open(KEYS_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception as e:
-        logger.exception("Failed to append to keys.txt: %s", e)
-        raise
-    return {"key": key, "expires": expiry}
-
-def admin_only(user_id: int) -> bool:
-    return user_id in admins
-
-# ---------------- Commands ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_session(uid)
-    msg = (
-        "👋 Logs Search Bot with Key Access\n\n"
-        "Commands:\n"
-        "/unlock <key> - unlock bot (required before /search)\n"
-        "/lock - lock your session\n"
-        "/search <keyword> <maxlines> - search logs.txt (max 300 lines)\n\n"
-        "Admin commands:\n"
-        "/gen <days> - generate a new key (admin only)\n"
-        "/downloadkey - download keys.txt (admin only)\n"
-        "/help - this message\n"
-    )
-    await update.message.reply_text(msg)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-async def unlock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    sess = ensure_session(uid)
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /unlock <key>")
-        return
-    key = " ".join(args).strip()
-    ok, reason = is_key_valid(key)
-    if ok:
-        sess["unlocked"] = True
-        sess["used_key"] = key
-        await update.message.reply_text(f"🔓 Unlocked — access granted. (Key: {key[:4]}... )")
-    else:
-        await update.message.reply_text(f"Key invalid: {reason}")
-
-async def lock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    sess = ensure_session(uid)
-    sess["unlocked"] = False
-    sess["used_key"] = None
-    await update.message.reply_text("🔒 Locked. Use /unlock <key> to unlock again.")
-
-async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    sess = ensure_session(uid)
-    if not sess.get("unlocked", False):
-        await update.message.reply_text("❗ You must unlock first with /unlock <key> before using /search.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /search <keyword> <maxlines> (max 300)")
-        return
-    keyword = args[0].strip()
-    try:
-        maxlines = int(args[1])
-    except ValueError:
-        await update.message.reply_text("Maxlines must be an integer (1..300).")
-        return
-    if maxlines < 1:
-        maxlines = 1
-    if maxlines > MAX_LINES_LIMIT:
-        maxlines = MAX_LINES_LIMIT
-
-    if not os.path.exists(LOG_FILE):
-        await update.message.reply_text("logs.txt not found on server.")
-        return
-
-    found = []
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if keyword.lower() in line.lower():
-                    if line.strip() not in found:
-                        found.append(line.rstrip("\n"))
-                    if len(found) >= maxlines:
-                        break
-    except Exception as e:
-        logger.exception("Search failed: %s", e)
-        await update.message.reply_text("Search failed: " + str(e))
-        return
-
-    if not found:
-        await update.message.reply_text("No results found.")
-        return
-
-    # write temporary file and send
-    filename = f"results_{keyword}_{uid}.txt"
-    try:
-        with open(filename, "w", encoding="utf-8") as out:
-            out.write("\n".join(found))
-        await update.message.reply_document(document=open(filename, "rb"))
-    finally:
-        try:
-            if os.path.exists(filename):
-                os.remove(filename)
-        except Exception:
-            pass
-
-async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not admin_only(uid):
-        await update.message.reply_text("Only admins can generate keys.")
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /gen <days>  (e.g. /gen 30)")
-        return
-    try:
-        days = int(args[0])
-    except ValueError:
-        await update.message.reply_text("Days must be an integer (number of days until expiry).")
-        return
-    try:
-        info = generate_key(days)
-    except Exception as e:
-        await update.message.reply_text("Failed to generate key: " + str(e))
-        return
-    await update.message.reply_text(f"🔑 Generated key: `{info['key']}` (expires {info['expires'].isoformat()})", parse_mode="Markdown")
-
-async def downloadkey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not admin_only(uid):
-        await update.message.reply_text("Only admins can download keys.")
-        return
-    if not os.path.exists(KEYS_FILE):
-        await update.message.reply_text("No keys.txt file exists yet.")
-        return
-    try:
-        await update.message.reply_document(document=InputFile(KEYS_FILE))
-    except Exception as e:
-        logger.exception("Failed to send keys.txt: %s", e)
-        await update.message.reply_text("Failed to send keys.txt: " + str(e))
-
-async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin convenience: /addadmin <numeric_user_id>"""
-    uid = update.effective_user.id
-    if not admin_only(uid):
-        await update.message.reply_text("Only admins can add admins.")
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /addadmin <numeric_user_id>")
-        return
-    try:
-        new_id = int(args[0])
-        admins.add(new_id)
-        save_admins()
-        await update.message.reply_text(f"Added admin: {new_id}")
-    except Exception as e:
-        await update.message.reply_text("Invalid id or error: " + str(e))
-
-async def removeadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not admin_only(uid):
-        await update.message.reply_text("Only admins can remove admins.")
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /removeadmin <numeric_user_id>")
-        return
-    try:
-        rem = int(args[0])
-        if rem in admins:
-            admins.remove(rem)
-            save_admins()
-            await update.message.reply_text(f"Removed admin: {rem}")
-        else:
-            await update.message.reply_text("That id is not an admin.")
-    except Exception as e:
-        await update.message.reply_text("Invalid id or error: " + str(e))
-
-async def listadmins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not admin_only(uid):
-        await update.message.reply_text("Only admins.")
-        return
-    await update.message.reply_text("Admins: " + ", ".join(str(x) for x in sorted(admins)))
-
-# ---------------- entrypoint ----------------
-
-def main():
-    # load admins from seed + file
-    load_admins()
-
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set.")
-        return
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # basic commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("unlock", unlock_cmd))
-    app.add_handler(CommandHandler("lock", lock_cmd))
-    app.add_handler(CommandHandler("search", search_cmd))
-
-    # admin commands
-    app.add_handler(CommandHandler("gen", gen_cmd))
-    app.add_handler(CommandHandler("downloadkey", downloadkey_cmd))
-    app.add_handler(CommandHandler("addadmin", addadmin_cmd))
-    app.add_handler(CommandHandler("removeadmin", removeadmin_cmd))
-    app.add_handler(CommandHandler("listadmins", listadmins_cmd))
 
     logger.info("Bot starting (polling)...")
     app.run_polling()
